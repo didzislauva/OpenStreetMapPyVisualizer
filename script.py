@@ -1,217 +1,202 @@
-import numpy as np
 import requests
 import json
 import geopandas as gpd
 import matplotlib.pyplot as plt
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Polygon, Point, box  # Fixed Missing Import
+import pyproj
+from pathlib import Path
+import logging
+import time
+from typing import Dict, List, Tuple, Optional
 
-# Define Overpass API URL
-overpass_url = "http://overpass-api.de/api/interpreter"
+# Set up logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-# Define a properly proportioned bounding box near Riga, Latvia
-# At this latitude, longitude degrees are more stretched than latitude degrees
-# Longitude: 1 degree ≈ 66.4 km
-# Latitude: 1 degree ≈ 111.3 km
-# To make a square 1km x 1km area, we need different deltas for lat/lon
+class OSMMapGenerator:
+    """Class to fetch and visualize OpenStreetMap data for a specified area, including water bodies."""
+    
+    def __init__(self, center_lat: float, center_lon: float, radius_meters: float = 500):
+        self.center_lat = center_lat
+        self.center_lon = center_lon
+        self.radius_meters = radius_meters
+        self.overpass_url = "https://overpass-api.de/api/interpreter"
+        self.output_dir = Path("output")
+        self.output_dir.mkdir(exist_ok=True)
+        
+        # Coordinate transformations
+        self.wgs84_to_lks92 = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:25884", always_xy=True)
+        self.lks92_to_wgs84 = pyproj.Transformer.from_crs("EPSG:25884", "EPSG:4326", always_xy=True)
+        
+        # Calculate bounding box
+        self.bbox = self._calculate_bbox()
+        
+        # Define feature styles
+        self.styles = {
+            "forests": {"color": "darkgreen", "alpha": 0.5, "label": "Forests"},
+            "buildings": {"color": "firebrick", "alpha": 0.7, "edgecolor": "black", "linewidth": 0.5, "label": "Buildings"},
+            "water": {"color": "lightblue", "alpha": 0.5, "label": "Water Bodies"},
+            "rivers": {"color": "blue", "linewidth": 1.5, "label": "Rivers"},
+            "lakes": {"color": "deepskyblue", "alpha": 0.7, "label": "Lakes"},
+            "channels": {"color": "lightblue", "linewidth": 1.2, "label": "Channels"},
+            "roads": {
+                "motorway": {"color": "orangered", "linewidth": 2.5},
+                "trunk": {"color": "orangered", "linewidth": 2.5},
+                "primary": {"color": "orangered", "linewidth": 2.5},
+                "secondary": {"color": "orange", "linewidth": 1.8},
+                "tertiary": {"color": "orange", "linewidth": 1.8},
+                "residential": {"color": "gray", "linewidth": 1.2},
+                "service": {"color": "gray", "linewidth": 1.2},
+                "default": {"color": "black", "linewidth": 0.8, "linestyle": "--"}
+            }
+        }
+    
+    def _calculate_bbox(self) -> Tuple[float, float, float, float]:
+        """Calculate bounding box in WGS 84 based on center point and radius."""
+        center_x, center_y = self.wgs84_to_lks92.transform(self.center_lon, self.center_lat)
+        xmin, xmax = center_x - self.radius_meters, center_x + self.radius_meters
+        ymin, ymax = center_y - self.radius_meters, center_y + self.radius_meters
+        
+        bbox_wgs84 = [self.lks92_to_wgs84.transform(x, y) for x, y in [(xmin, ymin), (xmin, ymax), (xmax, ymax), (xmax, ymin)]]
+        south, west = bbox_wgs84[0][1], bbox_wgs84[0][0]
+        north, east = bbox_wgs84[2][1], bbox_wgs84[2][0]
+        
+        return south, west, north, east
 
-# Define center point
-center_lat, center_lon = 56.855, 24.305  # Salaspils area near Riga
+    def fetch_osm_data(self, feature_type: str) -> Optional[dict]:
+        """Fetch OSM data for a specific feature type."""
+        query = self._get_overpass_query(feature_type)
+        if not query:
+            logger.error(f"No query found for {feature_type}")
+            return None
 
-# Define size in km
-size_km = 1.0
+        logger.info(f"Fetching {feature_type} data from Overpass...")
 
-# Calculate deltas (converting km to degrees)
-delta_lat = size_km / 111.3  # approximately 0.009 degrees
-delta_lon = size_km / (111.3 * np.cos(np.radians(center_lat)))  # approximately 0.015 degrees
+        for attempt in range(3):
+            try:
+                response = requests.get(self.overpass_url, params={"data": query}, timeout=30)
+                response.raise_for_status()
+                data = response.json()
 
-# Calculate bounding box
-south = center_lat - delta_lat/2
-north = center_lat + delta_lat/2
-west = center_lon - delta_lon/2
-east = center_lon + delta_lon/2
+                num_elements = len(data.get("elements", []))
+                logger.info(f"✅ Retrieved {num_elements} {feature_type} elements.")
 
-print(f"Using bounding box: S={south}, W={west}, N={north}, E={east}")
-bbox = f"{south},{west},{north},{east}"  # Overpass format: south, west, north, east
+                return data
+            except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+                logger.warning(f"Attempt {attempt+1}/3 failed: {str(e)}")
+                time.sleep(5)
 
-# Define Overpass API queries for roads, buildings, and forests
-queries = {
-    "roads": f"""
-    [out:json];
-    (
-      way["highway"]({bbox});
-    );
-    out geom;
-    """,
-    "buildings": f"""
-    [out:json];
-    (
-      way["building"]({bbox});
-    );
-    out geom;
-    """,
-    "forests": f"""
-    [out:json];
-    (
-      way["landuse"="forest"]({bbox});
-    );
-    out geom;
-    """
-}
-
-# Function to fetch and save OSM data
-def fetch_osm_data(query, filename):
-    print(f"Fetching {filename}...")
-    response = requests.get(overpass_url, params={"data": query})
-    if response.status_code == 200:
-        data = response.json()
-        with open(filename, "w") as f:
-            json.dump(data, f, indent=2)
-        print(f"✅ Successfully fetched {filename}")
-        return data
-    else:
-        print(f"❌ Failed to fetch {filename}: Status code {response.status_code}")
-        print(response.text)
+        logger.error(f"❌ Failed to fetch {feature_type} data.")
         return None
 
-# Function to process OSM data into GeoDataFrame
-def process_osm_data(data, feature_type="line"):
-    if not data or "elements" not in data:
-        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-    
-    geometries = []
-    properties = []
-    
-    for element in data.get("elements", []):
-        if element["type"] == "way" and "geometry" in element:
-            # Extract coordinates directly from the geometry field
-            coords = [(node["lon"], node["lat"]) for node in element["geometry"]]
-            
-            if len(coords) < 2:
-                continue
-                
-            # Create the appropriate geometry type
-            if feature_type == "polygon" and len(coords) >= 3:
-                # Close the polygon if needed
-                if coords[0] != coords[-1]:
-                    coords.append(coords[0])
-                geo = Polygon(coords)
-            else:
-                geo = LineString(coords)
-                
-            geometries.append(geo)
-            
-            # Extract properties
-            props = {k: v for k, v in element.get("tags", {}).items()}
-            properties.append(props)
-    
-    # Create GeoDataFrame with properties
-    if geometries:
+
+    def _get_overpass_query(self, feature_type: str) -> str:
+        """Generate Overpass API query for a specific feature type."""
+        bbox_str = f"{self.bbox[0]},{self.bbox[1]},{self.bbox[2]},{self.bbox[3]}"
+
+        queries = {
+            "roads": f"""[out:json];(way["highway"]({bbox_str}););out geom;""",
+            "buildings": f"""[out:json];(way["building"]({bbox_str}););out geom;""",
+            "forests": f"""[out:json];(way["landuse"="forest"]({bbox_str});way["natural"="wood"]({bbox_str}););out geom;""",
+            "water": f"""[out:json];(way["natural"="water"]({bbox_str});way["waterway"]({bbox_str});relation["natural"="water"]({bbox_str});relation["waterway"]({bbox_str}););out geom;""",
+            "rivers": f"""[out:json];(way["waterway"="river"]({bbox_str}););out geom;""",
+            "lakes": f"""[out:json];(way["natural"="water"]({bbox_str});relation["natural"="water"]({bbox_str}););out geom;""",
+            "channels": f"""[out:json];(way["waterway"="canal"]({bbox_str});way["waterway"="ditch"]({bbox_str});way["waterway"="stream"]({bbox_str}););out geom;"""
+        }
+
+        return queries.get(feature_type, "")
+
+
+    def process_osm_data(self, data: Optional[dict], feature_type: str) -> gpd.GeoDataFrame:
+        """Process OSM data into a GeoDataFrame and clip to bounding box."""
+        if not data or "elements" not in data:
+            logger.warning(f"⚠️ No data found for {feature_type}")
+            return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+        geometries = []
+        properties = []
+        geometry_type = "polygon" if feature_type in ["buildings", "forests", "lakes"] else "line"
+
+        for element in data.get("elements", []):
+            if element["type"] == "way" and "geometry" in element:
+                coords = [(node["lon"], node["lat"]) for node in element["geometry"]]
+                if len(coords) < 2:
+                    continue
+                geo = Polygon(coords) if geometry_type == "polygon" and len(coords) >= 3 else LineString(coords)
+                geometries.append(geo)
+                properties.append(element.get("tags", {}))
+
         gdf = gpd.GeoDataFrame(properties, geometry=geometries, crs="EPSG:4326")
-        return gdf
-    else:
-        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
-# Main process: fetch and process data
-print("Starting data fetch and map generation...")
+        # Clip to bounding box
+        bbox_polygon = box(self.bbox[1], self.bbox[0], self.bbox[3], self.bbox[2])  # west, south, east, north
+        gdf_clipped = gdf.clip(bbox_polygon)
 
-# Fetch OSM data
-roads_data = fetch_osm_data(queries["roads"], "roads.json")
-buildings_data = fetch_osm_data(queries["buildings"], "buildings.json")
-forests_data = fetch_osm_data(queries["forests"], "forests.json")
+        logger.info(f"✅ {feature_type.capitalize()} before clipping: {len(gdf)} elements.")
+        logger.info(f"🔪 {feature_type.capitalize()} after clipping: {len(gdf_clipped)} elements.")
 
-# Process into GeoDataFrames
-roads_gdf = process_osm_data(roads_data, "line")
-buildings_gdf = process_osm_data(buildings_data, "polygon")
-forests_gdf = process_osm_data(forests_data, "polygon")
+        if gdf_clipped.empty:
+            logger.warning(f"⚠️ {feature_type} is empty after clipping!")
 
-# Debug: Check if data exists
-print("✅ Roads found:", len(roads_gdf))
-print("✅ Buildings found:", len(buildings_gdf))
-print("✅ Forests found:", len(forests_gdf))
+        return gdf_clipped
 
-# Create a square figure
-fig, ax = plt.subplots(figsize=(10, 10))
 
-# Set equal aspect ratio to ensure proper proportions
-ax.set_aspect('equal')
-
-# Plot features with better styling
-if not forests_gdf.empty:
-    forests_gdf.plot(ax=ax, color="darkgreen", alpha=0.5, label="Forests")
-
-if not buildings_gdf.empty:
-    buildings_gdf.plot(ax=ax, color="firebrick", alpha=0.7, edgecolor="black", linewidth=0.5, label="Buildings")
-
-if not roads_gdf.empty:
-    # Style roads by type if available
-    highway_types = roads_gdf["highway"].unique() if "highway" in roads_gdf.columns else []
     
-    if len(highway_types) > 1:
-        # Plot different road types with different styles
-        for road_type in highway_types:
-            subset = roads_gdf[roads_gdf["highway"] == road_type]
-            if road_type in ["motorway", "trunk", "primary"]:
-                subset.plot(ax=ax, color="orangered", linewidth=2.5, label=f"{road_type} road")
-            elif road_type in ["secondary", "tertiary"]:
-                subset.plot(ax=ax, color="orange", linewidth=1.8, label=f"{road_type} road")
-            elif road_type in ["residential", "service"]:
-                subset.plot(ax=ax, color="gray", linewidth=1.2, label=f"{road_type} road")
-            else:
-                subset.plot(ax=ax, color="black", linewidth=0.8, linestyle="--", label=f"{road_type}")
-    else:
-        # Simple road styling if types not available
-        roads_gdf.plot(ax=ax, color="black", linewidth=1.5, label="Roads")
+    def generate_map(self):
+        """Generate and save the map."""
+        feature_types = ["roads", "buildings", "forests", "rivers", "lakes", "channels", "water"]
+        gdfs = {ft: self.process_osm_data(self.fetch_osm_data(ft), ft) for ft in feature_types}
 
-# Add map details
-ax.set_title("OpenStreetMap Visualization - Salaspils area near Riga, Latvia")
-ax.set_xlabel("Longitude")
-ax.set_ylabel("Latitude")
+        # Log the number of elements for each feature
+        for feature, gdf in gdfs.items():
+            logger.info(f"📌 {feature.capitalize()} - {len(gdf)} elements.")
 
-# Set extent to match our bounding box exactly
-ax.set_xlim(west, east)
-ax.set_ylim(south, north)
+        fig, ax = plt.subplots(figsize=(12, 12))
+        ax.set_aspect("equal")
 
-# Remove duplicates in legend
-handles, labels = ax.get_legend_handles_labels()
-by_label = dict(zip(labels, handles))
-if by_label:
-    ax.legend(by_label.values(), by_label.keys(), loc='best', frameon=True, framealpha=0.8)
+        # Plot features in correct order
+        plot_order = ["water", "lakes", "forests", "rivers", "channels", "roads", "buildings"]
 
-# Add scale bar (approximate)
-def add_scale_bar(ax, length_km=0.25):
-    # Convert length to coordinates
-    x_start, y_start = 0.05, 0.05  # Position in axis coordinates
-    
-    # Convert km to degrees (approximate at this latitude)
-    length_deg_lon = length_km / (111.3 * np.cos(np.radians(center_lat)))
-    
-    # Convert to axis coordinates
-    x_end = x_start + length_deg_lon / (east - west)
-    
-    # Add scale bar
-    ax.plot([west + x_start * (east - west), west + x_end * (east - west)], 
-            [south + y_start * (north - south), south + y_start * (north - south)], 
-            'k-', linewidth=3, transform=ax.transData)
-    
-    # Add text
-    ax.text(west + ((x_start + x_end) / 2) * (east - west),
-            south + (y_start - 0.02) * (north - south),
-            f"{length_km} km", ha='center', transform=ax.transData)
+        for feature in plot_order:
+            if feature in gdfs:
+                gdf = gdfs[feature]
+                if gdf is not None and not gdf.empty:
+                    logger.info(f"🟢 Plotting {feature} ({len(gdf)} elements)")
 
-add_scale_bar(ax)
+                    try:
+                        # Special handling for roads
+                        if feature == "roads":
+                            if "highway" in gdf.columns:
+                                for road_type in gdf["highway"].unique():
+                                    subset = gdf[gdf["highway"] == road_type]
 
-# Add north arrow
-ax.annotate('N', xy=(0.95, 0.95), xycoords='axes fraction',
-            xytext=(0.95, 0.85), textcoords='axes fraction',
-            arrowprops=dict(facecolor='black', width=5, headwidth=15),
-            ha='center', va='center', fontsize=12, fontweight='bold')
+                                    if subset.empty:
+                                        logger.warning(f"⚠️ No roads found for type: {road_type}")
+                                        continue
 
-# Save map as JPG and PDF
-plt.savefig("map.jpg", dpi=300, bbox_inches="tight")
-plt.savefig("map.pdf", dpi=300, bbox_inches="tight")
+                                    style = self.styles["roads"].get(road_type, self.styles["roads"]["default"])
+                                    subset.plot(ax=ax, label=f"{road_type} road", **style)
+                            else:
+                                logger.warning("⚠️ No 'highway' column in roads data")
+                                gdf.plot(ax=ax, color="black", linewidth=1.5, label="Roads")
+                        else:
+                            # Default for all other layers
+                            gdf.plot(ax=ax, **self.styles.get(feature, {"color": "black"}))
 
-# Show the plot
-plt.tight_layout()
-plt.show()
+                    except Exception as e:
+                        logger.error(f"❌ Error plotting {feature}: {str(e)}")
 
-print("✅ Map successfully generated: 'map.jpg' and 'map.pdf' 🎉")
+        ax.set_title("OSM Map with Roads, Water, and Buildings")
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+
+        plt.savefig(self.output_dir / "osm_map.jpg", dpi=300, bbox_inches="tight")
+        plt.show()
+
+
+
+def main():
+    map_gen = OSMMapGenerator(56.9198, 23.8714, 500)
+    map_gen.generate_map()
+
+main()
