@@ -1,3 +1,4 @@
+import numpy as np
 import requests
 import json
 import geopandas as gpd
